@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +11,8 @@ from typing import Any
 
 import requests
 from pydantic import BaseModel, Field
+
+from backend.config import AppConfig, get_settings
 
 FRED_API_KEY_ENV = "FRED_API_KEY"
 FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
@@ -85,16 +86,23 @@ class FredClient:
         cache_path: str | Path | None = None,
         timeout_seconds: float = 10.0,
         base_url: str = FRED_OBSERVATIONS_URL,
+        settings: AppConfig | None = None,
     ) -> None:
-        """Initialize the client from an explicit key or ``FRED_API_KEY``."""
+        """Initialize the client from explicit values or centralized config."""
 
-        self.api_key = api_key or os.getenv(FRED_API_KEY_ENV)
+        active_settings = settings or get_settings()
+        self.api_key = api_key or active_settings.fred_api_key
         if not self.api_key:
             raise FredApiKeyError(
                 f"Missing required environment variable {FRED_API_KEY_ENV}"
             )
 
-        self.cache_path = Path(cache_path) if cache_path is not None else None
+        resolved_cache_path = (
+            cache_path if cache_path is not None else active_settings.cache_db_path
+        )
+        self.cache_path = (
+            Path(resolved_cache_path) if resolved_cache_path is not None else None
+        )
         self.timeout_seconds = timeout_seconds
         self.base_url = base_url
         if self.cache_path is not None:
