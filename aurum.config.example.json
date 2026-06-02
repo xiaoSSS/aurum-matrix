@@ -1,0 +1,45 @@
+﻿{
+  "data_mode": "real",
+  "market_provider": "alpha_vantage",
+  "macro_provider": "fred",
+  "fred_api_key": "",
+  "alpha_vantage_api_key": "",
+  "siliconflow_api_key": "",
+  "siliconflow_model": "deepseek-ai/DeepSeek-V4-Pro",
+  "siliconflow_base_url": "https://api.siliconflow.cn/v1",
+  "cache_db_path": ".aurum_cache.db",
+  "default_dxy_symbol": "USDX",
+  "cache_ttl_market_hours": 24,
+  "cache_ttl_macro_hours": 24,
+  "cache_ttl_cftc_hours": 24,
+  "cache_ttl_etf_hours": 24,
+  "cache_ttl_central_bank_gold_hours": 720,
+  "pricing_model_frequency": "quarterly",
+  "pricing_model_train_start": "2000-01-01",
+  "pricing_model_train_end": "2025-12-31",
+  "pricing_model_validation_start": "2021-01-01",
+  "pricing_model_validation_end": "2025-12-31",
+  "pricing_model_inflation_series": "CPIAUCSL",
+  "etf_flows_url": "",
+  "cftc_cot_url": "",
+  "central_bank_gold_url": "",
+  "imf_gold_reserves_url": "",
+  "pricing_model_coefficients_monthly": {
+    "intercept": 0,
+    "central_bank_gold_purchase_tonnes": 0,
+    "us_total_public_debt": 0,
+    "dxy_price": 0
+  },
+  "pricing_model_coefficients_quarterly": {
+    "intercept": 0,
+    "central_bank_gold_purchase_tonnes": 0,
+    "us_total_public_debt": 0,
+    "dxy_price": 0
+  },
+  "pricing_model_coefficients_annual": {
+    "intercept": 0,
+    "central_bank_gold_purchase_tonnes": 0,
+    "us_total_public_debt": 0,
+    "dxy_price": 0
+  }
+}

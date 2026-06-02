@@ -19,6 +19,8 @@ FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
 TEN_YEAR_REAL_RATE_SERIES_ID = "DFII10"
 TEN_YEAR_TREASURY_YIELD_SERIES_ID = "DGS10"
 TEN_YEAR_BREAKEVEN_INFLATION_SERIES_ID = "T10YIE"
+US_TOTAL_PUBLIC_DEBT_SERIES_ID = "GFDEBTN"
+CPI_INDEX_SERIES_ID = "CPIAUCSL"
 
 
 class FredClientError(RuntimeError):
@@ -166,6 +168,35 @@ class FredClient:
         observation_end: str | None = None,
     ) -> FredSeriesData:
         """Fetch an inflation-expectations related series, defaulting to T10YIE."""
+
+        return self.get_series_history(
+            series_id,
+            observation_start=observation_start,
+            observation_end=observation_end,
+        )
+
+    def get_us_total_public_debt(
+        self,
+        *,
+        observation_start: str | None = None,
+        observation_end: str | None = None,
+    ) -> FredSeriesData:
+        """Fetch total public debt (GFDEBTN)."""
+
+        return self.get_series_history(
+            US_TOTAL_PUBLIC_DEBT_SERIES_ID,
+            observation_start=observation_start,
+            observation_end=observation_end,
+        )
+
+    def get_cpi_index(
+        self,
+        *,
+        series_id: str = CPI_INDEX_SERIES_ID,
+        observation_start: str | None = None,
+        observation_end: str | None = None,
+    ) -> FredSeriesData:
+        """Fetch inflation index observations, defaulting to CPIAUCSL."""
 
         return self.get_series_history(
             series_id,

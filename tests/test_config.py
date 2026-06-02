@@ -51,3 +51,12 @@ def test_clients_accept_centralized_config(tmp_path) -> None:  # type: ignore[no
     assert market_client.api_key == "av-key"
     assert market_client.cache_path == tmp_path / "cache.db"
     assert market_client.dxy_symbol == "DXY_CUSTOM"
+
+
+def test_app_config_reads_file() -> None:
+    settings = AppConfig.from_file(
+        Path(__file__).resolve().parents[1] / "aurum.config.example.json"
+    )
+    assert settings.market_provider == "alpha_vantage"
+    assert settings.macro_provider == "fred"
+    assert settings.default_dxy_symbol == "USDX"
