@@ -85,7 +85,4 @@ def test_real_gold_data_provider_outputs_unified_structure() -> None:
     assert data.treasury_yield_history[-1].value == 4.5
     assert data.inflation_expectations_history[-1].value == 2.3
     assert data.xau_usd_daily[-1].date == "2026-05-29"
-    assert any(
-        "ETF 资金流、CFTC 持仓和地缘风险真实数据源尚未接入" in error
-        for error in data.errors
-    )
+    assert any("ETF flow data unavailable" in warning for warning in data.warnings)

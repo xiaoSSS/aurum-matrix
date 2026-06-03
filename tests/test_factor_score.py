@@ -177,3 +177,18 @@ def test_decide_from_total_score_boundaries() -> None:
     assert decide_from_total_score(0) == "中性"
     assert decide_from_total_score(-20) == "偏空"
     assert decide_from_total_score(-60) == "强空"
+
+def test_factor_score_does_not_block_when_etf_and_cftc_missing() -> None:
+    result = calculate_factor_score(
+        _input(etf_flow_trend=None, cftc_position_state=None)
+    )
+    assert result.flow_score == 0
+    assert result.total_score == 49
+    assert result.decision == "偏多"
+
+
+def test_factor_score_supports_partial_enhanced_factors() -> None:
+    result = calculate_factor_score(_input(etf_flow_trend=None))
+    assert result.flow_score == 25
+    assert result.total_score == 55
+    assert result.decision == "偏多"

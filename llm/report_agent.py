@@ -1,16 +1,14 @@
-"""Deterministic Markdown report agent for structured decision-engine output.
-
-This module intentionally does not call an LLM. It only formats values already
-present in the decision-engine JSON and uses ``数据不足`` whenever required
-fields or section details are missing.
-"""
+"""LLM report generator with deterministic fallback."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import requests
 from pydantic import BaseModel
+
+from backend.config import AppConfig, get_settings
 
 REQUIRED_DECISION_FIELDS = (
     "macro_score",
@@ -22,35 +20,74 @@ REQUIRED_DECISION_FIELDS = (
     "risks",
 )
 
-MACRO_KEYWORDS = ("实际利率", "美元", "DXY", "宏观", "通胀")
-TECHNICAL_KEYWORDS = ("金价", "MA", "均线", "MACD", "RSI", "技术", "趋势")
-FLOW_KEYWORDS = ("ETF", "CFTC", "资金", "持仓", "投机")
 
-
-def generate_markdown_report(decision_json: Mapping[str, Any] | BaseModel) -> str:
-    """Generate a Chinese Markdown report from structured decision JSON only.
-
-    The function does not infer or create new numeric values. Every score and
-    text fragment in the report is copied from the supplied structured input.
-    Missing or empty fields are rendered as ``数据不足``.
-    """
+def generate_markdown_report(
+    decision_json: Mapping[str, Any] | BaseModel,
+    *,
+    settings: AppConfig | None = None,
+) -> str:
+    """Generate report via SiliconFlow LLM, fallback to deterministic template."""
 
     payload = _normalize_payload(decision_json)
+    active_settings = settings or get_settings()
+    try:
+        return _generate_via_siliconflow(payload, active_settings)
+    except Exception:
+        return _generate_fallback_markdown(payload)
+
+
+def _generate_via_siliconflow(payload: Mapping[str, Any], settings: AppConfig) -> str:
+    api_key = settings.siliconflow_api_key
+    if not api_key:
+        raise ValueError("Missing siliconflow_api_key")
+
+    url = settings.siliconflow_base_url.rstrip("/") + "/chat/completions"
+    system_prompt = (
+        "你是黄金投研报告助手。你只能依据输入JSON写中文Markdown，"
+        "不得编造新数值。输出必须包含：当前结论、宏观环境、技术趋势、资金流、操作建议、风险提示。"
+    )
+    user_prompt = (
+        "请基于以下结构化JSON生成报告：\n"
+        f"{payload}\n"
+        "注意：若某字段缺失，明确写“数据不足”。"
+    )
+    body = {
+        "model": settings.siliconflow_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    content = (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+        .strip()
+    )
+    if not content:
+        raise ValueError("Empty LLM response content")
+    return content
+
+
+def _generate_fallback_markdown(payload: Mapping[str, Any]) -> str:
     missing_fields = [
         field for field in REQUIRED_DECISION_FIELDS if _is_empty(payload.get(field))
     ]
-
-    macro_reasons = _section_items(
-        payload, explicit_key="macro_reasons", keywords=MACRO_KEYWORDS
-    )
-    technical_reasons = _section_items(
-        payload,
-        explicit_key="technical_reasons",
-        keywords=TECHNICAL_KEYWORDS,
-    )
-    flow_reasons = _section_items(
-        payload, explicit_key="flow_reasons", keywords=FLOW_KEYWORDS
-    )
+    macro_reasons = _section_items(payload, explicit_key="macro_reasons")
+    technical_reasons = _section_items(payload, explicit_key="technical_reasons")
+    flow_reasons = _section_items(payload, explicit_key="flow_reasons")
     risks = _list_field(payload.get("risks"))
 
     lines = ["# 黄金当前价位评估报告", ""]
@@ -79,39 +116,29 @@ def generate_markdown_report(decision_json: Mapping[str, Any] | BaseModel) -> st
         ]
     )
     if missing_fields:
-        lines.extend(
-            ["", f"> 数据不足：缺少或为空的字段：{', '.join(missing_fields)}。"]
-        )
+        lines.extend(["", f"> 数据不足：缺少或为空的字段：{', '.join(missing_fields)}。"])
     return "\n".join(lines)
 
 
 def _normalize_payload(decision_json: Mapping[str, Any] | BaseModel) -> dict[str, Any]:
-    """Normalize a mapping or Pydantic model to a plain dict."""
-
     if isinstance(decision_json, BaseModel):
         return decision_json.model_dump()
     if isinstance(decision_json, Mapping):
         return dict(decision_json)
-    raise TypeError("decision_json must be a structured JSON mapping or Pydantic model")
+    raise TypeError("decision_json must be mapping or Pydantic model")
 
 
 def _conclusion(payload: Mapping[str, Any], missing_fields: Sequence[str]) -> str:
-    """Build the conclusion line using only provided values."""
-
     if missing_fields:
         return "数据不足"
     return (
-        f"当前结论：{payload['decision']}；"
-        f"总分：{payload['total_score']}；"
-        f"宏观分：{payload['macro_score']}；"
-        f"技术分：{payload['technical_score']}；"
+        f"当前结论：{payload['decision']}；总分：{payload['total_score']}；"
+        f"宏观分：{payload['macro_score']}；技术分：{payload['technical_score']}；"
         f"资金流分：{payload['flow_score']}。"
     )
 
 
 def _operation_advice(payload: Mapping[str, Any]) -> str:
-    """Build operation advice without adding numbers or unsupported projections."""
-
     decision = payload.get("decision")
     if _is_empty(decision):
         return "数据不足"
@@ -119,39 +146,25 @@ def _operation_advice(payload: Mapping[str, Any]) -> str:
 
 
 def _score_line(label: str, value: Any) -> str:
-    """Render a score line or 数据不足 when the score is missing."""
-
     if _is_empty(value):
         return f"{label}：数据不足"
     return f"{label}：{value}"
 
 
-def _section_items(
-    payload: Mapping[str, Any], *, explicit_key: str, keywords: Sequence[str]
-) -> list[str]:
-    """Return explicit section items, or categorize general reasons by keywords."""
-
-    explicit_items = _list_field(payload.get(explicit_key))
-    if explicit_items:
-        return explicit_items
-
-    reasons = _list_field(payload.get("reasons"))
-    return [
-        reason for reason in reasons if any(keyword in reason for keyword in keywords)
-    ]
+def _section_items(payload: Mapping[str, Any], *, explicit_key: str) -> list[str]:
+    explicit = _list_field(payload.get(explicit_key))
+    if explicit:
+        return explicit
+    return _list_field(payload.get("reasons"))
 
 
 def _bullet_block(items: Sequence[str]) -> str:
-    """Render bullet list or 数据不足 for an empty section."""
-
     if not items:
         return "- 数据不足"
     return "\n".join(f"- {item}" for item in items)
 
 
 def _list_field(value: Any) -> list[str]:
-    """Return a clean list of non-empty strings from a JSON array-like value."""
-
     if isinstance(value, str):
         return [value] if value else []
     if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
@@ -160,8 +173,6 @@ def _list_field(value: Any) -> list[str]:
 
 
 def _is_empty(value: Any) -> bool:
-    """Return True for missing, blank, or empty collection values."""
-
     if value is None:
         return True
     if isinstance(value, str):

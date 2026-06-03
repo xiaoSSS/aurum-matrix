@@ -18,21 +18,11 @@ TEST_ALPHA_VANTAGE_API_KEY = "demo-alpha-key"
 
 def _xau_payload() -> dict[str, object]:
     return {
-        "Meta Data": {"1. Information": "Forex Daily Prices"},
-        "Time Series FX (Daily)": {
-            "2026-05-29": {
-                "1. open": "2360.10",
-                "2. high": "2375.20",
-                "3. low": "2351.30",
-                "4. close": "2368.40",
-            },
-            "2026-05-28": {
-                "1. open": "2350.00",
-                "2. high": "2365.00",
-                "3. low": "2345.00",
-                "4. close": "2360.10",
-            },
-        },
+        "nominal": "USD",
+        "data": [
+            {"date": "2026-05-28", "price": "2360.10"},
+            {"date": "2026-05-29", "price": "2368.40"},
+        ],
     }
 
 
@@ -63,16 +53,16 @@ def test_alpha_vantage_client_reads_api_key_from_environment(monkeypatch, reques
     assert data.provider == "alpha_vantage"
     assert data.cached is False
     assert [bar.date for bar in data.bars] == ["2026-05-28", "2026-05-29"]
-    assert data.bars[-1].open == 2360.10
-    assert data.bars[-1].high == 2375.20
-    assert data.bars[-1].low == 2351.30
+    assert data.bars[-1].open == 2368.40
+    assert data.bars[-1].high == 2368.40
+    assert data.bars[-1].low == 2368.40
     assert data.bars[-1].close == 2368.40
     assert data.bars[-1].volume is None
     request = requests_mock.last_request
     assert request is not None
-    assert request.qs["function"] == ["fx_daily"]
-    assert request.qs["from_symbol"] == ["xau"]
-    assert request.qs["to_symbol"] == ["usd"]
+    assert request.qs["function"] == ["gold_silver_history"]
+    assert request.qs["symbol"] == ["gold"]
+    assert request.qs["interval"] == ["daily"]
     assert request.qs["apikey"] == [TEST_ALPHA_VANTAGE_API_KEY]
 
 
@@ -99,7 +89,7 @@ def test_alpha_vantage_client_gets_dxy_daily_with_unified_fields(requests_mock) 
     request = requests_mock.last_request
     assert request is not None
     assert request.qs["function"] == ["time_series_daily"]
-    assert request.qs["symbol"] == ["dxy"]
+    assert request.qs["symbol"] == ["usdx"]
     assert request.qs["outputsize"] == ["full"]
 
 
@@ -156,15 +146,15 @@ def test_alpha_vantage_client_raises_clear_error_on_missing_time_series(requests
     requests_mock.get(ALPHA_VANTAGE_QUERY_URL, json={"Meta Data": {}})
     client = AlphaVantageMarketClient(api_key=TEST_ALPHA_VANTAGE_API_KEY)
 
-    with pytest.raises(MarketResponseError, match="Time Series FX"):
+    with pytest.raises(MarketResponseError, match="missing 'data'"):
         client.get_xau_usd_daily()
 
 
 def test_alpha_vantage_client_raises_clear_error_on_invalid_numeric_field(requests_mock) -> None:  # type: ignore[no-untyped-def]
     payload = _xau_payload()
-    payload["Time Series FX (Daily)"]["2026-05-29"]["4. close"] = "not-a-number"  # type: ignore[index]
+    payload["data"][1]["price"] = "not-a-number"  # type: ignore[index]
     requests_mock.get(ALPHA_VANTAGE_QUERY_URL, json=payload)
     client = AlphaVantageMarketClient(api_key=TEST_ALPHA_VANTAGE_API_KEY)
 
-    with pytest.raises(MarketResponseError, match="4. close"):
+    with pytest.raises(MarketResponseError, match="Invalid 'price'"):
         client.get_xau_usd_daily()

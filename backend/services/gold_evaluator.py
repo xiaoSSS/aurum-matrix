@@ -1,4 +1,4 @@
-"""End-to-end gold evaluation service using normalized data providers."""
+﻿"""End-to-end gold evaluation service using normalized data providers."""
 
 from __future__ import annotations
 
@@ -26,19 +26,21 @@ from scoring.factor_score import (
     Trend,
     calculate_factor_score,
 )
+from scoring.pricing_model import (
+    PricingModelInput,
+    PricingModelResult,
+    calculate_pricing_model,
+    select_pricing_coefficients,
+)
+from data_sources.sqlite_cache import read_pricing_model_coefficients
 
 DataStatus = Literal["ok", "insufficient_data"]
 Action = Literal["增配", "持有", "观望", "减配", "回避", "数据不足"]
 
-RISK_DISCLAIMER = (
-    "风险提示：本工具仅用于黄金当前价位的规则化评估，不做确定性价格预测，"
-    "不提供收益承诺，也不构成投资建议。"
-)
+RISK_DISCLAIMER = "风险提示：本工具仅用于评估，不构成收益承诺或投资建议。"
 
 
 class GoldIndicatorValues(BaseModel):
-    """Latest technical indicators used by factor scoring."""
-
     ma20: float = Field(gt=0)
     ma60: float = Field(gt=0)
     ma120: float = Field(gt=0)
@@ -49,20 +51,20 @@ class GoldIndicatorValues(BaseModel):
 
 
 class MacroEnvironment(BaseModel):
-    """Macro and DXY inputs normalized for the response."""
-
     real_yield_10y: float | None = None
     treasury_yield_10y: float | None = None
     inflation_expectations: float | None = None
+    inflation_index: float | None = None
     real_yield_trend: Trend | None = None
     dxy_trend: Trend | None = None
     etf_flow_trend: Trend | None = None
     cftc_position_state: CftcPositionState | None = None
+    geopolitical_risk_state: str | None = None
+    central_bank_gold_purchase_tonnes: float | None = None
+    us_total_public_debt: float | None = None
 
 
 class EvaluateGoldResponse(BaseModel):
-    """Complete API response for the gold evaluation flow."""
-
     symbol: str = "XAUUSD"
     currency: str = "USD/oz"
     data_status: DataStatus
@@ -75,18 +77,19 @@ class EvaluateGoldResponse(BaseModel):
     macro: MacroEnvironment
     factor_input: FactorScoreInput | None = None
     score: FactorScoreResult | None = None
+    valuation: PricingModelResult | None = None
+    enhanced_data_status: dict[str, bool] = Field(default_factory=dict)
     market_state: str
     action: Action
     reasons: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     report_markdown: str
     risk_disclaimer: str = RISK_DISCLAIMER
 
 
 class GoldEvaluatorService:
-    """Application service that owns the gold evaluation business workflow."""
-
     def __init__(
         self,
         *,
@@ -95,16 +98,12 @@ class GoldEvaluatorService:
         macro_client: GoldMacroDataClient | None = None,
         settings: AppConfig | None = None,
     ) -> None:
-        """Initialize the evaluator with optional test/provider dependencies."""
-
         self.data_provider = data_provider
         self.market_client = market_client
         self.macro_client = macro_client
         self.settings = settings
 
     def evaluate(self, *, mode: DataMode | None = None) -> EvaluateGoldResponse:
-        """Run the full gold evaluation pipeline from data retrieval to report."""
-
         active_settings = self._settings_for_mode(mode)
         provider = self.data_provider or create_gold_data_provider(
             settings=active_settings,
@@ -113,10 +112,12 @@ class GoldEvaluatorService:
         )
         data = provider.get_gold_data()
         errors = list(data.errors)
+        warnings = list(data.warnings)
 
         indicators = _calculate_indicator_values(data.xau_usd_daily, errors)
         macro = _build_macro_environment(data, errors)
-        factor_input = _build_factor_input(data, indicators, macro, errors)
+        valuation = _build_valuation(data, warnings, active_settings)
+        factor_input = _build_factor_input(data, indicators, macro, errors, valuation)
 
         score: FactorScoreResult | None = None
         if factor_input is not None:
@@ -126,7 +127,7 @@ class GoldEvaluatorService:
         action = _action_from_market_state(market_state)
         reasons = score.reasons if score is not None else []
         risks = score.risks if score is not None else [RISK_DISCLAIMER]
-        report_markdown = _generate_report(score, errors)
+        report_markdown = _generate_report(score, errors, valuation)
 
         return EvaluateGoldResponse(
             data_status="ok" if score is not None else "insufficient_data",
@@ -139,17 +140,18 @@ class GoldEvaluatorService:
             macro=macro,
             factor_input=factor_input,
             score=score,
+            valuation=valuation,
+            enhanced_data_status=_enhanced_data_status(data, valuation),
             market_state=market_state,
             action=action,
             reasons=reasons,
             risks=risks,
             errors=list(dict.fromkeys(errors)),
+            warnings=list(dict.fromkeys(warnings)),
             report_markdown=report_markdown,
         )
 
     def _settings_for_mode(self, mode: DataMode | None) -> AppConfig:
-        """Return configured settings, optionally overriding data mode."""
-
         active_settings = self.settings or get_settings()
         if mode is None:
             return active_settings
@@ -164,8 +166,6 @@ def evaluate_gold(
     settings: AppConfig | None = None,
     mode: DataMode | None = None,
 ) -> EvaluateGoldResponse:
-    """Backward-compatible function wrapper around ``GoldEvaluatorService``."""
-
     return GoldEvaluatorService(
         data_provider=data_provider,
         market_client=market_client,
@@ -182,8 +182,6 @@ def evaluate_gold_from_data_sources(
     settings: AppConfig | None = None,
     mode: DataMode | None = None,
 ) -> EvaluateGoldResponse:
-    """Backward-compatible alias for the new backend evaluator."""
-
     return evaluate_gold(
         data_provider=data_provider,
         market_client=market_client,
@@ -196,15 +194,11 @@ def evaluate_gold_from_data_sources(
 def _calculate_indicator_values(
     bars: list[UnifiedDailyBar], errors: list[str]
 ) -> GoldIndicatorValues | None:
-    """Calculate MA20/MA60/MA120, MACD, RSI and ATR from XAU/USD bars."""
-
     if not bars:
-        errors.append("XAU/USD 日线历史为空，无法计算技术指标。")
+        errors.append("XAU/USD history is empty.")
         return None
 
-    frame = pd.DataFrame(
-        [bar.model_dump() for bar in sorted(bars, key=lambda item: item.date)]
-    )
+    frame = pd.DataFrame([bar.model_dump() for bar in sorted(bars, key=lambda item: item.date)])
     try:
         close = frame["close"].astype(float)
         high = frame["high"].astype(float)
@@ -220,38 +214,38 @@ def _calculate_indicator_values(
             atr=atr(high, low, close).latest_value,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        errors.append(f"技术指标数据不足：{exc}")
+        errors.append(f"Indicator input invalid: {exc}")
         return None
 
 
-def _build_macro_environment(
-    data: UnifiedGoldData, errors: list[str]
-) -> MacroEnvironment:
-    """Derive real-yield, DXY, ETF-flow and CFTC fields for scoring."""
-
+def _build_macro_environment(data: UnifiedGoldData, errors: list[str]) -> MacroEnvironment:
     real_yield_trend = _trend_from_observations(data.real_yield_history)
     if real_yield_trend is None:
-        errors.append("FRED 实际利率历史不足，无法计算 real_yield_trend。")
+        errors.append("Missing real_yield_trend.")
 
     dxy_trend = _trend_from_bars(data.dxy_daily)
     if dxy_trend is None:
-        errors.append("DXY 日线历史不足，无法计算 dxy_trend。")
+        errors.append("Missing dxy_trend.")
 
     etf_flow_trend = _trend_from_etf_flow(data.etf_flow_tonnes_5d)
     if etf_flow_trend is None:
-        errors.append("ETF 资金流数据不足，无法计算 etf_flow_trend。")
+        errors.append("Missing etf_flow_trend (enhanced only).")
 
     if data.cftc_position_state is None:
-        errors.append("CFTC 持仓状态数据不足，无法计算 cftc_position_state。")
+        errors.append("Missing cftc_position_state (enhanced only).")
 
     return MacroEnvironment(
         real_yield_10y=data.real_yield_10y,
         treasury_yield_10y=data.treasury_yield_10y,
         inflation_expectations=data.inflation_expectations,
+        inflation_index=data.inflation_index,
         real_yield_trend=real_yield_trend,
         dxy_trend=dxy_trend,
         etf_flow_trend=etf_flow_trend,
         cftc_position_state=data.cftc_position_state,
+        geopolitical_risk_state=_geopolitical_risk_state(data.geopolitical_risk_index),
+        central_bank_gold_purchase_tonnes=data.central_bank_gold_purchase_tonnes,
+        us_total_public_debt=data.us_total_public_debt,
     )
 
 
@@ -260,9 +254,8 @@ def _build_factor_input(
     indicators: GoldIndicatorValues | None,
     macro: MacroEnvironment,
     errors: list[str],
+    valuation: PricingModelResult | None = None,
 ) -> FactorScoreInput | None:
-    """Assemble and validate factor-score input from computed data."""
-
     missing: list[str] = []
     if data.gold_price is None:
         missing.append("gold_price")
@@ -272,21 +265,15 @@ def _build_factor_input(
         missing.append("real_yield_trend")
     if macro.dxy_trend is None:
         missing.append("dxy_trend")
-    if macro.etf_flow_trend is None:
-        missing.append("etf_flow_trend")
-    if macro.cftc_position_state is None:
-        missing.append("cftc_position_state")
 
     if missing:
-        errors.append(f"factor_score 输入数据不足：{', '.join(missing)}。")
+        errors.append("factor_score 输入数据不足：" + ", ".join(missing))
         return None
 
     assert indicators is not None
     assert data.gold_price is not None
     assert macro.real_yield_trend is not None
     assert macro.dxy_trend is not None
-    assert macro.etf_flow_trend is not None
-    assert macro.cftc_position_state is not None
 
     return FactorScoreInput(
         gold_price=data.gold_price,
@@ -300,14 +287,116 @@ def _build_factor_input(
         dxy_trend=macro.dxy_trend,
         etf_flow_trend=macro.etf_flow_trend,
         cftc_position_state=macro.cftc_position_state,
+        geopolitical_risk_state=macro.geopolitical_risk_state,
+        valuation_score=valuation.valuation_score if valuation is not None else None,
     )
+
+
+def _build_valuation(
+    data: UnifiedGoldData, warnings: list[str], settings: AppConfig
+) -> PricingModelResult | None:
+    required = (
+        data.gold_price,
+        data.dxy_price,
+        data.central_bank_gold_purchase_tonnes,
+        data.us_total_public_debt,
+    )
+    if any(value is None for value in required):
+        warnings.append("Pricing model unavailable: missing one or more inputs")
+        return None
+    frequency, coefficients = _resolve_pricing_coefficients(settings)
+    if not coefficients:
+        warnings.append("Pricing model unavailable: coefficients are incomplete")
+        return None
+
+    result = calculate_pricing_model(
+        PricingModelInput(
+            gold_price=float(data.gold_price),
+            dxy_price=float(data.dxy_price),
+            central_bank_gold_purchase_tonnes=float(
+                data.central_bank_gold_purchase_tonnes
+            ),
+            us_total_public_debt=float(data.us_total_public_debt),
+            inflation_index=data.inflation_index,
+            inflation_multiplier=_inflation_multiplier(data),
+            frequency=frequency,
+        ),
+        coefficients,
+    )
+    if result is None:
+        warnings.append("Pricing model unavailable: coefficients are incomplete")
+    return result
+
+
+def _resolve_pricing_coefficients(
+    settings: AppConfig,
+) -> tuple[str, dict[str, float]]:
+    monthly = dict(settings.pricing_model_coefficients_monthly)
+    quarterly = dict(settings.pricing_model_coefficients_quarterly)
+    annual = dict(settings.pricing_model_coefficients_annual)
+    if settings.cache_db_path is not None:
+        cached = read_pricing_model_coefficients(settings.cache_db_path)
+        monthly = monthly or _cached_coefficients(cached, "monthly")
+        quarterly = quarterly or _cached_coefficients(cached, "quarterly")
+        annual = annual or _cached_coefficients(cached, "annual")
+    return select_pricing_coefficients(
+        frequency=settings.pricing_model_frequency,
+        monthly=monthly,
+        quarterly=quarterly,
+        annual=annual,
+        legacy=settings.pricing_model_coefficients,
+    )
+
+
+def _cached_coefficients(
+    cached: dict[str, dict[str, object]], frequency: str
+) -> dict[str, float]:
+    payload = cached.get(frequency, {})
+    raw = payload.get("coefficients") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            out[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _inflation_multiplier(data: UnifiedGoldData) -> float:
+    history = [
+        item.value
+        for item in sorted(data.inflation_index_history, key=lambda x: x.date)
+        if item.value is not None and item.value > 0
+    ]
+    if data.inflation_index is not None and data.inflation_index > 0:
+        current = float(data.inflation_index)
+    elif history:
+        current = float(history[-1])
+    else:
+        return 1.0
+    base = float(history[0]) if history else current
+    if base <= 0:
+        return 1.0
+    return current / base
+
+
+def _enhanced_data_status(
+    data: UnifiedGoldData, valuation: PricingModelResult | None
+) -> dict[str, bool]:
+    return {
+        "etf": data.etf_flow_tonnes_5d is not None,
+        "cftc": data.cftc_position_state is not None,
+        "central_bank_gold": data.central_bank_gold_purchase_tonnes is not None,
+        "us_debt": data.us_total_public_debt is not None,
+        "valuation": valuation is not None,
+    }
 
 
 def _trend_from_observations(
     observations: list[UnifiedMacroObservation], *, tolerance: float = 0.0
 ) -> Trend | None:
-    """Return trend from the latest two non-missing macro observations."""
-
     values = [
         item.value
         for item in sorted(observations, key=lambda observation: observation.date)
@@ -316,20 +405,12 @@ def _trend_from_observations(
     return _trend_from_values(values, tolerance=tolerance)
 
 
-def _trend_from_bars(
-    bars: list[UnifiedDailyBar], *, tolerance: float = 0.0
-) -> Trend | None:
-    """Return trend from the latest two DXY closes."""
-
+def _trend_from_bars(bars: list[UnifiedDailyBar], *, tolerance: float = 0.0) -> Trend | None:
     values = [bar.close for bar in sorted(bars, key=lambda x: x.date)]
     return _trend_from_values(values, tolerance=tolerance)
 
 
-def _trend_from_values(
-    values: list[float], *, tolerance: float = 0.0
-) -> Trend | None:
-    """Classify the latest movement as up, down or flat."""
-
+def _trend_from_values(values: list[float], *, tolerance: float = 0.0) -> Trend | None:
     if len(values) < 2:
         return None
     change = values[-1] - values[-2]
@@ -339,8 +420,6 @@ def _trend_from_values(
 
 
 def _trend_from_etf_flow(value: float | None) -> Trend | None:
-    """Classify latest ETF flow as up/down/flat without inventing values."""
-
     if value is None:
         return None
     if value > 0:
@@ -350,9 +429,17 @@ def _trend_from_etf_flow(value: float | None) -> Trend | None:
     return "flat"
 
 
-def _action_from_market_state(market_state: str) -> Action:
-    """Map factor-score market state to portfolio/trading action."""
+def _geopolitical_risk_state(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value >= 70:
+        return "high"
+    if value <= 40:
+        return "low"
+    return "neutral"
 
+
+def _action_from_market_state(market_state: str) -> Action:
     mapping: dict[str, Action] = {
         "强多": "增配",
         "偏多": "持有",
@@ -363,11 +450,16 @@ def _action_from_market_state(market_state: str) -> Action:
     return mapping.get(market_state, "数据不足")
 
 
-def _generate_report(score: FactorScoreResult | None, errors: list[str]) -> str:
-    """Generate deterministic Markdown from structured score output only."""
-
+def _generate_report(
+    score: FactorScoreResult | None,
+    errors: list[str],
+    valuation: PricingModelResult | None = None,
+) -> str:
     if score is not None:
-        return generate_markdown_report(score)
+        payload = score.model_dump()
+        if valuation is not None:
+            payload["valuation"] = valuation.model_dump()
+        return generate_markdown_report(payload)
     return generate_markdown_report(
         {
             "macro_score": None,

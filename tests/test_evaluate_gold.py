@@ -42,3 +42,29 @@ def test_evaluate_gold_endpoint_supports_mode_query_override(monkeypatch) -> Non
     assert payload["data_mode"] == "mock"
     assert payload["provider"] == "mock"
     assert payload["price"] == 2368.4
+
+
+def test_pricing_model_status_endpoint_returns_shape() -> None:
+    client = TestClient(app)
+
+    response = client.get("/api/pricing-model/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["configured_frequency"] == "quarterly"
+    assert "configured_coefficients" in payload
+    assert "cached_coefficients" in payload
+
+
+def test_pricing_model_train_endpoint_degrades_without_live_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.delenv("ALPHA_VANTAGE_API_KEY", raising=False)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    client = TestClient(app)
+
+    response = client.post("/api/pricing-model/train")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] in {"ok", "insufficient_data"}
+    assert "results" in payload
+    assert "errors" in payload

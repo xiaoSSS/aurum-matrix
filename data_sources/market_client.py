@@ -19,6 +19,7 @@ ALPHA_VANTAGE_API_KEY_ENV = "ALPHA_VANTAGE_API_KEY"
 ALPHA_VANTAGE_QUERY_URL = "https://www.alphavantage.co/query"
 XAU_USD_SYMBOL = "XAU/USD"
 DXY_SYMBOL = "DXY"
+DEFAULT_DXY_PROVIDER_SYMBOL = "USDX"
 
 MarketAsset = Literal["XAU/USD", "DXY"]
 OutputSize = Literal["compact", "full"]
@@ -135,28 +136,27 @@ class AlphaVantageMarketClient(MarketDataProvider):
     def get_xau_usd_daily(
         self, *, outputsize: OutputSize = "compact"
     ) -> DailyMarketData:
-        """Return XAU/USD daily bars from Alpha Vantage FX_DAILY."""
+        """Return XAU/USD proxy daily bars from GOLD_SILVER_HISTORY.
+
+        Alpha Vantage does not support XAU/USD via FX_DAILY. We therefore use
+        GOLD_SILVER_HISTORY(symbol=GOLD, interval=daily) and map the daily
+        commodity price to unified OHLC fields.
+        """
 
         request = MarketDataRequest(
             symbol=XAU_USD_SYMBOL,
-            function="FX_DAILY",
+            function="GOLD_SILVER_HISTORY",
             outputsize=outputsize,
         )
         payload, cached = self._get_payload(
             request,
             {
-                "function": "FX_DAILY",
-                "from_symbol": "XAU",
-                "to_symbol": "USD",
-                "outputsize": outputsize,
+                "function": "GOLD_SILVER_HISTORY",
+                "symbol": "GOLD",
+                "interval": "daily",
             },
         )
-        bars = _parse_alpha_vantage_time_series(
-            payload,
-            series_key="Time Series FX (Daily)",
-            symbol=XAU_USD_SYMBOL,
-            include_volume=False,
-        )
+        bars = _parse_alpha_vantage_gold_history(payload, symbol=XAU_USD_SYMBOL)
         return DailyMarketData(
             symbol=XAU_USD_SYMBOL,
             provider="alpha_vantage",
@@ -167,25 +167,66 @@ class AlphaVantageMarketClient(MarketDataProvider):
     def get_dxy_daily(self, *, outputsize: OutputSize = "compact") -> DailyMarketData:
         """Return DXY daily bars from Alpha Vantage TIME_SERIES_DAILY."""
 
+        provider_symbol = self.dxy_symbol
         request = MarketDataRequest(
-            symbol=self.dxy_symbol,
+            symbol=provider_symbol,
             function="TIME_SERIES_DAILY",
             outputsize=outputsize,
         )
-        payload, cached = self._get_payload(
-            request,
-            {
-                "function": "TIME_SERIES_DAILY",
-                "symbol": self.dxy_symbol,
-                "outputsize": outputsize,
-            },
-        )
+        try:
+            payload, cached = self._get_payload(
+                request,
+                {
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": provider_symbol,
+                    "outputsize": outputsize,
+                },
+            )
+        except MarketResponseError:
+            if provider_symbol.upper() == DEFAULT_DXY_PROVIDER_SYMBOL:
+                raise
+            fallback_symbol = DEFAULT_DXY_PROVIDER_SYMBOL
+            fallback_request = MarketDataRequest(
+                symbol=fallback_symbol,
+                function="TIME_SERIES_DAILY",
+                outputsize=outputsize,
+            )
+            payload, cached = self._get_payload(
+                fallback_request,
+                {
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": fallback_symbol,
+                    "outputsize": outputsize,
+                },
+            )
+            provider_symbol = fallback_symbol
         bars = _parse_alpha_vantage_time_series(
             payload,
             series_key="Time Series (Daily)",
-            symbol=self.dxy_symbol,
+            symbol=provider_symbol,
             include_volume=True,
         )
+        if len(bars) < 2 and provider_symbol.upper() != DEFAULT_DXY_PROVIDER_SYMBOL:
+            fallback_symbol = DEFAULT_DXY_PROVIDER_SYMBOL
+            fallback_request = MarketDataRequest(
+                symbol=fallback_symbol,
+                function="TIME_SERIES_DAILY",
+                outputsize=outputsize,
+            )
+            payload, cached = self._get_payload(
+                fallback_request,
+                {
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": fallback_symbol,
+                    "outputsize": outputsize,
+                },
+            )
+            bars = _parse_alpha_vantage_time_series(
+                payload,
+                series_key="Time Series (Daily)",
+                symbol=fallback_symbol,
+                include_volume=True,
+            )
         return DailyMarketData(
             symbol=DXY_SYMBOL,
             provider="alpha_vantage",
@@ -359,6 +400,52 @@ def _parse_alpha_vantage_time_series(
                     if include_volume
                     else None
                 ),
+            )
+        )
+    if not bars:
+        raise MarketResponseError(
+            f"Alpha Vantage returned no daily bars for symbol={symbol}"
+        )
+    return bars
+
+
+def _parse_alpha_vantage_gold_history(
+    payload: dict[str, Any], *, symbol: str
+) -> list[DailyBar]:
+    """Parse GOLD_SILVER_HISTORY payload into unified daily bars."""
+
+    raw_series = payload.get("data")
+    if not isinstance(raw_series, list):
+        raise MarketResponseError(
+            f"Alpha Vantage response missing 'data' for symbol={symbol}"
+        )
+
+    bars: list[DailyBar] = []
+    for item in sorted(raw_series, key=lambda x: x.get("date", "")):
+        if not isinstance(item, dict):
+            raise MarketResponseError(
+                f"Invalid daily bar structure for symbol={symbol}"
+            )
+        date = item.get("date")
+        if not isinstance(date, str):
+            raise MarketResponseError(
+                f"Invalid daily bar date for symbol={symbol}: {date!r}"
+            )
+        raw_price = item.get("price")
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError) as exc:
+            raise MarketResponseError(
+                f"Invalid 'price' value for symbol={symbol} date={date}: {raw_price!r}"
+            ) from exc
+        bars.append(
+            DailyBar(
+                date=date,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=None,
             )
         )
     if not bars:
